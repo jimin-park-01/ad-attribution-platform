@@ -1,7 +1,8 @@
 # 광고 데이터 플랫폼 (Ad Data Platform)
 
-Kafka, Spark, Iceberg, Airflow 기반으로 광고 데이터를 수집, 처리, 저장하는  
-Lakehouse 아키텍처 기반 데이터 플랫폼을 구축하는 프로젝트입니다.
+Kafka, Spark, Iceberg, Airflow 기반으로 광고 데이터를 수집, 처리, 저장하고  
+AWS Lakehouse 환경(S3, Glue, Athena, QuickSight)까지 연결하는  
+데이터 플랫폼을 구축하는 프로젝트입니다.
 
 데이터 수집부터 처리, 저장, 관리, 활용까지 이어지는 전체 흐름을 설계하고  
 Streaming 기반 데이터 파이프라인과 데이터 관리 구조를 이해하는 것을 목표로 합니다.
