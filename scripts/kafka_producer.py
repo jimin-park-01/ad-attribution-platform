@@ -1,0 +1,387 @@
+"""
+광고 이벤트 스트리밍 시뮬레이터 (Kafka Producer).
+
+배치 CSV 데이터를 실시간 스트림처럼 Kafka로 재생한다. 항상 3토픽으로 분리 발행하며,
+silver layer가 event_id 기준으로 조립하는 medallion 구조와 정렬된다.
+
+토픽:
+  ad-impressions  <- 노출 이벤트 (즉시)
+  ad-clicks       <- 클릭 이벤트 (수 초 후 합성 지연)
+  ad-conversions  <- 전환 이벤트 (수 시간 후, --delay-scale 로 축소)
+
+Criteo는 impression 중심 결합 데이터이므로, click은 1~30초 합성 지연을 주고
+conversion은 conversion_timestamp를 그대로 이용해 파생한다.
+"""
+
+# 전체 처리 흐름
+#
+# ad_events.csv
+#   ↓
+# 광고 이벤트 순차 재생
+#   ↓
+# Impression / Click / Conversion 분리
+#   ↓
+# Kafka 3개 토픽 발행
+#
+#   ad-impressions
+#   ad-clicks
+#   ad-conversions
+#
+#   ↓
+# Click 지연 시뮬레이션
+#   (1~30초)
+#
+#   ↓
+# Conversion 지연 시뮬레이션
+#   (Late Event 재현)
+#
+#   ↓
+# PriorityQueue 기반 예약 발행
+#
+#   ↓
+# Kafka Streaming 이벤트 생성
+#
+#   ↓
+# Bronze Streaming 수집 대상 생성
+#
+# 설계 목적
+#
+# - 정적 CSV를 실시간 이벤트처럼 재생
+# - 광고 플랫폼의 이벤트 흐름 재현
+# - Late Event 시나리오 재현
+# - Bronze/Silver Medallion 구조와 정렬
+# - Silver에서 event_id 기준 JOIN 가능하도록 이벤트 분리
+
+import argparse
+import csv
+import json
+import random
+import threading
+import time
+from datetime import datetime
+from queue import Empty, PriorityQueue
+
+
+# CSV 데이터를 실시간 광고 이벤트처럼 재생하는 핵심 클래스
+#
+# 역할
+# 1. CSV 읽기
+# 2. Impression / Click / Conversion 분리
+# 3. Kafka 토픽 발행
+# 4. Late Event 시뮬레이션
+class AdEventStreamer:
+    """CSV 광고 이벤트 데이터를 3토픽으로 스트리밍하는 시뮬레이터."""
+
+    # kafka producer 생성 ( Producer = Kafka에 메시지 보내는 객체 )
+    def __init__(
+        self,
+        bootstrap_servers="localhost:9092",
+        speed_multiplier=100,
+        conversion_delay_scale=0.01,
+    ):
+        try:
+            from kafka import KafkaProducer
+        except ImportError:
+            print("=" * 50)
+            print("  kafka-python-ng 패키지가 필요합니다")
+            print("  pip install kafka-python-ng")
+            print("=" * 50)
+            raise SystemExit(1)
+
+        # kafka 메시지 발행 객체 생성
+        # Impression / Click / Conversion 이벤트를 Kafka로 전송
+        self.producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+            key_serializer=lambda k: k.encode("utf-8") if k else None,
+        )
+        self.speed_multiplier = speed_multiplier
+        self.conversion_delay_scale = conversion_delay_scale
+        # PriorityQueue: 발행 예약 시각(send_at) 기준 정렬을 보장한다.
+        # 여러 이벤트의 지연 시간이 섞여 큐에 쌓여도 가장 빠른 순서로 꺼낼 수 있다.
+        self.delayed_queue = PriorityQueue()
+        self.stats = {
+            "impressions": 0,
+            "clicks": 0,
+            "conversions": 0,
+            "clicks_sent": 0,
+            "conversions_sent": 0,
+            "delayed_pending": 0,
+        }
+        self._stop = False
+        self._rng = random.Random(42)
+        self._sequence = 0
+
+    # 예약 발송 담당 -> 실시간 이벤트 발생 순서를 재현하기 위해 PriorityQueue + Worker Thread를 사용
+    def _delayed_event_worker(self):
+        """지연된 click / conversion 이벤트를 예약 시간에 맞춰 발행하는 워커.
+
+        메인 스레드가 Impression을 순차 처리하는 동안 Click/Conversion은
+        각자의 지연 시간 후 독립적으로 발행되어야 한다.
+        동일 스레드에서 sleep으로 처리하면 메인 Impression 처리 속도 전체가 블로킹되므로
+        별도 스레드로 분리한다.
+        """
+        while not self._stop or self.stats["delayed_pending"] > 0:
+            if self.delayed_queue.empty():
+                time.sleep(0.1)
+                continue
+
+            try:
+                send_at, _, topic, event = self.delayed_queue.get(timeout=1)
+                while True:
+                    remaining = send_at - time.time()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 5))
+
+                self.producer.send(topic, key=event["uid"], value=event)
+                self.stats["delayed_pending"] -= 1
+
+                if topic == "ad-clicks":
+                    self.stats["clicks_sent"] += 1
+                elif topic == "ad-conversions":
+                    self.stats["conversions_sent"] += 1
+
+                total_delayed = self.stats["clicks_sent"] + self.stats["conversions_sent"]
+                if total_delayed % 50 == 0:
+                    print(
+                        f"  [delayed] click: {self.stats['clicks_sent']}  "
+                        f"conv: {self.stats['conversions_sent']}  "
+                        f"대기: {self.stats['delayed_pending']}"
+                    )
+
+            except Empty:
+                continue
+            except Exception as exc:
+                if not self._stop:
+                    print(f"  [error] 지연 발행 오류: {exc}")
+
+    # 메인 로직 함수 
+    # csv 읽기 -> 행 반복 -> 시간 차 계산 -> _emit_event() -> kafka 전송
+    def stream_from_csv(self, csv_path, max_events=None):
+        """CSV 파일을 읽어 3토픽으로 스트리밍."""
+        worker = threading.Thread(target=self._delayed_event_worker, daemon=True)
+        worker.start()
+
+        print("=" * 60)
+        print("  광고 이벤트 스트리밍 시뮬레이터 (3토픽)")
+        print("=" * 60)
+        print(f"  파일:        {csv_path}")
+        print(f"  재생 속도:   {self.speed_multiplier}x")
+        print(f"  전환 지연:   {self.conversion_delay_scale}x 축소")
+        print(f"  토픽:")
+        print(f"    ad-impressions  <- 노출 (즉시)")
+        print(f"    ad-clicks       <- 클릭 (수 초 후)")
+        print(f"    ad-conversions  <- 전환 (지연 발행)")
+        if max_events:
+            print(f"  최대 이벤트: {max_events:,}건")
+        print("=" * 60)
+        print()
+
+        prev_ts = None
+        start_time = time.time()
+
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+
+            for i, row in enumerate(reader):
+                if max_events and i >= max_events:
+                    break
+
+                ts = int(row["timestamp"])
+                event_id = f"evt_{i:08d}"
+
+                # 실시간 처럼 재생 -> sleep -> 차이를 유지하지 않으면 1초만에 100만건 전송될 것임
+                if prev_ts is not None and ts > prev_ts:
+                    real_delay = (ts - prev_ts) / self.speed_multiplier
+                    if 0 < real_delay < 5:
+                        time.sleep(real_delay)
+                prev_ts = ts
+
+                self._emit_event(row, ts, event_id)
+
+                if (i + 1) % 1000 == 0:
+                    elapsed = time.time() - start_time
+                    pending = self.stats["delayed_pending"]
+                    print(
+                        f"  [{elapsed:6.1f}s] {i + 1:>8,}건 | "
+                        f"imp: {self.stats['impressions']:,}  "
+                        f"click: {self.stats['clicks']:,}  "
+                        f"대기: {pending}"
+                    )
+
+        self.producer.flush()
+
+        self._stop = True
+        if self.stats["delayed_pending"] > 0:
+            remaining = self.stats["delayed_pending"]
+            print(f"\n  메인 이벤트 완료. 지연 이벤트 {remaining}건 발행 대기...")
+            while self.stats["delayed_pending"] > 0:
+                print(f"    남은: {self.stats['delayed_pending']}건", end="\r")
+                time.sleep(1)
+        worker.join()
+        self.producer.flush()
+
+        elapsed = time.time() - start_time
+        print()
+        print("=" * 60)
+        print(f"  스트리밍 완료 ({elapsed:.1f}초)")
+        print("=" * 60)
+        print(f"  Impression:  {self.stats['impressions']:>10,}건 -> ad-impressions")
+        print(f"  Click:       {self.stats['clicks_sent']:>10,}건 -> ad-clicks")
+        print(f"  Conversion:  {self.stats['conversions_sent']:>10,}건 -> ad-conversions")
+        print("=" * 60)
+
+
+    # csv 한 줄로 세 이벤트 정보 모두 포함 -> 3개의 이벤트로 분리 
+    def _emit_event(self, row, ts, event_id):
+        """CSV 한 행을 impression / click / conversion 3개 토픽으로 분리 발행한다.
+
+        Silver 레이어는 event_id를 기준으로 impression/click/conversion을 JOIN하는 구조이므로
+        각 이벤트 타입이 별도 토픽에서 독립적으로 수신되어야 한다.
+        단일 토픽에 event_type 필드로 구분하면 Bronze 스키마가 event_type마다 달라
+        Spark 스키마 처리가 복잡해진다.
+        """
+        # 1) Impression: 즉시 발행. click/conversion 정보는 들어가지 않음.
+        impression = {
+            "event_id": event_id,
+            "event_type": "impression",
+            "timestamp": ts,
+            "event_time": datetime.fromtimestamp(ts).isoformat(),
+            "uid": row["uid"],
+            "campaign": int(row["campaign"]),
+            "cost": float(row["cost"]) if row["cost"] else 0.0,
+        }
+        self.producer.send("ad-impressions", key=row["uid"], value=impression)
+        self.stats["impressions"] += 1
+
+        # 2) Click: 1~30초 합성 지연 후 발행. impression_timestamp로 base와 연결.
+        if int(row["click"]):
+            self.stats["clicks"] += 1
+            click_delay_real = self._rng.randint(1, 30)
+            click_delay_scaled = click_delay_real / self.speed_multiplier
+
+            click_event = {
+                "event_id": event_id,
+                "event_type": "click",
+                "timestamp": ts + click_delay_real,
+                "event_time": datetime.fromtimestamp(ts + click_delay_real).isoformat(),
+                "impression_timestamp": ts,
+                "uid": row["uid"],
+                "campaign": int(row["campaign"]),
+            }
+
+            # 0.1초 미만이면 즉시 발행: OS 스케줄러 정밀도(~10ms) 이하의 sleep은
+            # 오히려 context switch 오버헤드가 커 큐 경유보다 직접 발행이 빠르다.
+            if click_delay_scaled < 0.1:
+                self.producer.send("ad-clicks", key=row["uid"], value=click_event)
+                self.stats["clicks_sent"] += 1
+            else:
+                send_at = time.time() + click_delay_scaled
+                self._sequence += 1
+                self.stats["delayed_pending"] += 1
+                self.delayed_queue.put(
+                    (send_at, self._sequence, "ad-clicks", click_event)
+                )
+
+        # 3) Conversion: 원본 (conversion_timestamp - timestamp) * delay_scale 만큼 지연.
+        if int(row.get("conversion", 0)) and row.get("conversion_timestamp"):
+            conv_ts = int(row["conversion_timestamp"])
+            original_delay = max(conv_ts - ts, 0)
+            self.stats["conversions"] += 1
+
+            conversion_event = {
+                "event_id": event_id,
+                "event_type": "conversion",
+                "timestamp": conv_ts,
+                "event_time": datetime.fromtimestamp(conv_ts).isoformat(),
+                "impression_timestamp": ts,
+                "uid": row["uid"],
+                "campaign": int(row["campaign"]),
+                "conversion_delay_sec": original_delay,
+            }
+
+            if self.conversion_delay_scale == 0:
+                self.producer.send(
+                    "ad-conversions", key=row["uid"], value=conversion_event
+                )
+                self.stats["conversions_sent"] += 1
+            else:
+                scaled_delay = original_delay * self.conversion_delay_scale
+                send_at = time.time() + scaled_delay
+                self._sequence += 1
+                self.stats["delayed_pending"] += 1
+                self.delayed_queue.put(
+                    (send_at, self._sequence, "ad-conversions", conversion_event)
+                )
+# 실제 광고 이벤트 흐름을 재현하기 위해 Impression, Click, Conversion을 독립 토픽으로 분리
+# Bronze 스키마 단순화와 Silver Join 구조를 위해 토픽을 이벤트 타입별로 분리
+
+
+# kafka 토픽 생성
+def create_topics(bootstrap_servers):
+    """3 토픽 사전 생성."""
+    try:
+        from kafka.admin import KafkaAdminClient, NewTopic
+
+        admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
+        topics = [
+            NewTopic(name="ad-impressions", num_partitions=3, replication_factor=1),
+            NewTopic(name="ad-clicks", num_partitions=3, replication_factor=1),
+            NewTopic(name="ad-conversions", num_partitions=3, replication_factor=1),
+        ]
+        existing = admin.list_topics()
+        new_topics = [t for t in topics if t.name not in existing]
+        if new_topics:
+            admin.create_topics(new_topics)
+            print(f"토픽 생성: {[t.name for t in new_topics]}")
+        else:
+            print("토픽이 이미 존재합니다.")
+        admin.close()
+    except Exception as e:
+        print(f"토픽 생성 건너뜀 (auto.create 활성화 시 자동 생성됨): {e}")
+
+
+# 전체 오케스트레이션 
+def main():
+    parser = argparse.ArgumentParser(description="광고 이벤트 스트리밍 시뮬레이터 (3토픽)")
+    parser.add_argument(
+        "--csv", default="./data/ad_events.csv",
+        help="입력 CSV 파일 (기본: ./data/ad_events.csv)",
+    )
+    parser.add_argument(
+        "--bootstrap-servers", default="localhost:9092",
+        help="Kafka 브로커 (기본: localhost:9092)",
+    )
+    parser.add_argument(
+        "--speed", type=int, default=100,
+        help="재생 속도 배율 (기본: 100x)",
+    )
+    parser.add_argument(
+        "--delay-scale", type=float, default=0.01,
+        help="전환 지연 축소 비율 (기본: 0.01 = 1시간->36초, 0=즉시)",
+    )
+    parser.add_argument(
+        "--max-events", type=int, default=None,
+        help="최대 이벤트 수 (기본: 전체)",
+    )
+    parser.add_argument(
+        "--create-topics", action="store_true",
+        help="Kafka 토픽 (ad-impressions/ad-clicks/ad-conversions) 사전 생성",
+    )
+
+    args = parser.parse_args()
+
+    if args.create_topics:
+        create_topics(args.bootstrap_servers)
+
+    streamer = AdEventStreamer(
+        bootstrap_servers=args.bootstrap_servers,
+        speed_multiplier=args.speed,
+        conversion_delay_scale=args.delay_scale,
+    )
+    streamer.stream_from_csv(args.csv, max_events=args.max_events)
+
+
+if __name__ == "__main__":
+    main()
