@@ -1,0 +1,321 @@
+##############################################################
+# Ad Attribution Lakehouse Platform
+#
+# Docker Compose 역할
+# ------------------------------------------------------------
+# Dockerfile이 개별 컨테이너 환경을 정의한다면,
+# docker-compose.yml은 프로젝트 전체 서비스를
+# 어떻게 구성하고 연결할 것인지를 정의한다.
+#
+# 주요 구성 요소
+#
+# Spark
+# - Bronze / Silver / Gold 데이터 처리
+#
+# Kafka
+# - 광고 이벤트 수집
+#
+# Kafka UI
+# - Kafka 토픽 및 메시지 모니터링
+#
+# Airflow
+# - 파이프라인 자동화 및 스케줄링
+#
+# Superset
+# - KPI 대시보드 및 시각화
+#
+# PostgreSQL
+# - Airflow 메타데이터 저장
+#
+# 설계 목표
+#
+# - 단일 명령으로 실습 환경 구성
+# - 서비스 간 네트워크 자동 연결
+# - 필요한 기능만 Profile 기반 실행
+# - 로컬 개발 환경 재현 가능
+#
+# 참고
+#
+# Docker Compose 공식 문서
+# https://docs.docker.com/compose/
+#
+# Airflow Docker Compose 예제
+# https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html
+#
+# Confluent Kafka Docker 예제
+# https://docs.confluent.io/platform/current/installation/docker/
+#
+##############################################################
+
+# 기본
+# docker compose up -d --build
+#
+# Kafka 포함
+# docker compose --profile streaming up -d
+#
+# Airflow 포함
+# docker compose --profile airflow up -d --build
+#
+# 전체
+# docker compose --profile streaming --profile airflow up -d
+
+services:
+  # ─── Jupyter + PySpark + Iceberg ───────────────────────────
+  spark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spark
+    ports:
+      - "8888:8888"   # Jupyter Notebook
+      - "4040:4040"   # Spark UI (job 실행 중에만 활성)
+    volumes:
+      - ./pipeline:/home/jovyan/pipeline
+      - ./scripts:/home/jovyan/scripts
+      - ./spark:/home/jovyan/spark
+      - ./conf:/home/jovyan/conf
+      - ./data:/home/jovyan/data
+      - warehouse:/home/jovyan/warehouse
+      - ${HOME}/.aws:/home/jovyan/.aws:ro
+    environment:
+      JUPYTER_TOKEN: lakehouse
+      AWS_PROFILE: ${AWS_PROFILE:-iceberg-lab}
+      AWS_REGION: ${AWS_REGION:-ap-northeast-2}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      AWS_SDK_LOAD_CONFIG: "1"
+      S3_BUCKET: ${S3_BUCKET:-}
+    networks:
+      - lakehouse
+
+  # ─── Kafka (streaming profile: Week 2+) ────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "cub zk-ready localhost:2181 5"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+# profiles 사용 이유
+#
+# 모든 서비스를 항상 실행할 필요는 없다.
+#
+# 기본:
+#   Spark + Superset
+#
+# streaming:
+#   Kafka + Kafka UI
+#
+# airflow:
+#   Airflow 관련 서비스
+#
+# 필요할 때만 실행하여
+# 리소스 사용량과 실습 복잡도를 줄인다.
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+  # Kafka UI — 토픽/메시지 시각화 (http://localhost:8090)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+    profiles: ["streaming"]
+    networks:
+      - lakehouse
+
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+
+    container_name: superset
+
+    ports:
+      - "8088:8088"
+
+    volumes:
+      - ${HOME}/.aws:/app/superset_home/.aws:ro
+
+    environment:
+      SUPERSET_SECRET_KEY: "ad-attribution-platform-superset-secret-key-2026"
+
+      AWS_PROFILE: ${AWS_PROFILE:-iceberg-lab}
+      AWS_REGION: ${AWS_REGION:-ap-northeast-2}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      AWS_SDK_LOAD_CONFIG: "1"
+
+    networks:
+      - lakehouse
+
+
+  # ─── Airflow (airflow profile: 자동화 실습용) ──────────────────
+  # docker compose --profile airflow up -d --build
+  #
+  # BashOperator가 `docker exec spark spark-submit ...` 으로 spark 컨테이너를 호출한다.
+  # user: "0:0" (root) 로 실행해야 /var/run/docker.sock 접근 권한이 해결된다.
+
+  airflow-postgres:
+    image: postgres:13
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles: ["airflow"]
+    networks:
+      - lakehouse
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-init
+    user: "0:0"
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname admin --lastname admin \
+          --role Admin --email admin@example.com || true
+    profiles: ["airflow"]
+    networks:
+      - lakehouse
+
+  # ─── Airflow Webserver (http://localhost:8080) ─────────────────
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-webserver
+    user: "0:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "ad-attribution-airflow-secret-2026"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      ICEBERG_CATALOG_MODE: ${ICEBERG_CATALOG_MODE:-local}
+      ICEBERG_CATALOG_NAME: ${ICEBERG_CATALOG_NAME:-local}
+      ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-/home/jovyan/warehouse}
+      ICEBERG_DATABASE: ${ICEBERG_DATABASE:-ad_lakehouse}
+      ICEBERG_MERGE_WINDOW_DAYS: ${ICEBERG_MERGE_WINDOW_DAYS:-7}
+      ICEBERG_GOLD_WINDOW_DAYS: ${ICEBERG_GOLD_WINDOW_DAYS:-7}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - airflow-logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    profiles: ["airflow"]
+    networks:
+      - lakehouse
+
+  # ─── Airflow Scheduler ────────────────────────────────────────
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-scheduler
+    user: "0:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      ICEBERG_CATALOG_MODE: ${ICEBERG_CATALOG_MODE:-local}
+      ICEBERG_CATALOG_NAME: ${ICEBERG_CATALOG_NAME:-local}
+      ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-/home/jovyan/warehouse}
+      ICEBERG_DATABASE: ${ICEBERG_DATABASE:-ad_lakehouse}
+      ICEBERG_MERGE_WINDOW_DAYS: ${ICEBERG_MERGE_WINDOW_DAYS:-7}
+      ICEBERG_GOLD_WINDOW_DAYS: ${ICEBERG_GOLD_WINDOW_DAYS:-7}
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - airflow-logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    profiles: ["airflow"]
+    networks:
+      - lakehouse
+
+volumes:
+  warehouse:
+  airflow-postgres:
+  airflow-logs:
+
+networks:
+  lakehouse:
+    driver: bridge
