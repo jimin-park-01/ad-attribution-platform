@@ -262,50 +262,106 @@ def write_outputs(sampled_lines, fieldnames, output_dir, keep_cats=False, base_t
         "conversion_timestamp",
         "cost",
     ]
+
     if keep_cats:
         output_fields.extend([f"cat{i}" for i in range(1, 10)])
 
-    main_path = os.path.join(output_dir, "ad_events.csv")
+    initial_path = os.path.join(output_dir, "ad_events_initial.csv")
     sample_path = os.path.join(output_dir, "ad_events_sample.csv")
-    batch_path = os.path.join(output_dir, "ad_events_batch_01.csv")
+
+    batch_specs = [
+        ("ad_events_batch_01.csv", 20_000),
+        ("ad_events_batch_02.csv", 30_000),
+        ("ad_events_batch_03.csv", 40_000),
+        ("ad_events_batch_04.csv", 50_000),
+        ("ad_events_batch_05.csv", 60_000),
+    ]
 
     sample_limit = min(1000, len(sampled_lines))
-    # 후반 20%를 batch_01로 분리하는 이유: 전체(80%)를 1차 적재 후 나머지를 2차 Append하여
-    # Bronze → Silver incremental MERGE 시나리오를 재현한다.
-    batch_start = int(len(sampled_lines) * 0.8)
+    initial_count = 800_000
+
     stats = init_stats()
 
+    batch_ranges = []
+
+    start = initial_count
+
+    for filename, count in batch_specs:
+        end = start + count
+        batch_ranges.append((filename, start, end))
+        start = end
+
     with (
-        open(main_path, "w", newline="") as main_file,
+        open(initial_path, "w", newline="") as initial_file,
         open(sample_path, "w", newline="") as sample_file,
-        open(batch_path, "w", newline="") as batch_file,
     ):
-        writers = {
-            "main": csv.DictWriter(main_file, fieldnames=output_fields),
-            "sample": csv.DictWriter(sample_file, fieldnames=output_fields),
-            "batch": csv.DictWriter(batch_file, fieldnames=output_fields),
-        }
-        for writer in writers.values():
+
+        initial_writer = csv.DictWriter(
+            initial_file,
+            fieldnames=output_fields,
+        )
+
+        sample_writer = csv.DictWriter(
+            sample_file,
+            fieldnames=output_fields,
+        )
+
+        initial_writer.writeheader()
+        sample_writer.writeheader()
+
+        batch_files = {}
+        batch_writers = {}
+
+        for filename, _ in batch_specs:
+            path = os.path.join(output_dir, filename)
+
+            handle = open(path, "w", newline="")
+
+            batch_files[filename] = handle
+
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=output_fields,
+            )
+
             writer.writeheader()
 
-        for idx, line in enumerate(sampled_lines):
-            row = parse_tsv_line(line, fieldnames)
-            converted = convert_row(row, keep_cats=keep_cats, base_timestamp=base_timestamp)
+            batch_writers[filename] = writer
 
-            writers["main"].writerow(converted)
-            if idx < sample_limit:
-                writers["sample"].writerow(converted)
-            if idx >= batch_start:
-                writers["batch"].writerow(converted)
+        try:
 
-            update_stats(stats, converted)
+            for idx, line in enumerate(sampled_lines):
+
+                row = parse_tsv_line(line, fieldnames)
+
+                converted = convert_row(
+                    row,
+                    keep_cats=keep_cats,
+                    base_timestamp=base_timestamp,
+                )
+
+                if idx < initial_count:
+                    initial_writer.writerow(converted)
+
+                if idx < sample_limit:
+                    sample_writer.writerow(converted)
+
+                for filename, start, end in batch_ranges:
+                    if start <= idx < end:
+                        batch_writers[filename].writerow(converted)
+                        break
+
+                update_stats(stats, converted)
+
+        finally:
+            for handle in batch_files.values():
+                handle.close()
 
     return {
-        "main_path": main_path,
+        "initial_path": initial_path,
         "sample_path": sample_path,
-        "batch_path": batch_path,
+        "batch_specs": batch_specs,
         "sample_limit": sample_limit,
-        "batch_count": len(sampled_lines) - batch_start,
         "stats": stats,
     }
 
@@ -403,19 +459,38 @@ def main():
     print_stats(result["stats"], "전체")
     print()
     print("-" * 60)
+
     print(
-        f"  {result['main_path']:<40} "
-        f"({os.path.getsize(result['main_path']) / 1024 / 1024:.1f} MB)"
+        f"  {result['initial_path']:<40} "
+        f"({os.path.getsize(result['initial_path']) / 1024 / 1024:.1f} MB)"
     )
-    print(f"  {result['sample_path']:<40} ({result['sample_limit']:,}건)")
+
     print(
-        f"  {result['batch_path']:<40} "
-        f"(batch, {result['batch_count']:,}건)"
+        f"  {result['sample_path']:<40} "
+        f"({result['sample_limit']:,}건)"
     )
+
+    for filename, count in result["batch_specs"]:
+        path = os.path.join(args.output, filename)
+
+        print(
+            f"  {path:<40} "
+            f"(batch, {count:,}건)"
+        )
+
     print()
     print("  다음 단계:")
-    print("    python scripts/kafka_producer.py --create-topics --csv ./data/ad_events.csv --max-events 0")
-    print("    python scripts/kafka_producer.py --csv ./data/ad_events.csv")
+    print("    초기 적재")
+    print("    python scripts/kafka_producer.py --create-topics --csv ./data/ad_events_initial.csv --max-events 0")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_initial.csv")
+    print()
+    print("    증분 적재")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_batch_01.csv")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_batch_02.csv")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_batch_03.csv")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_batch_04.csv")
+    print("    python scripts/kafka_producer.py --csv ./data/ad_events_batch_05.csv")
+
     print("=" * 60)
 
 
