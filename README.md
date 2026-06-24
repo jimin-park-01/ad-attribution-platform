@@ -119,6 +119,46 @@ Superset
 
 ---
 
+## 데이터셋
+
+본 프로젝트는 [Criteo Attribution Modeling Dataset](https://ailab.criteo.com/criteo-attribution-modeling-bidding-dataset/)을 사용합니다.
+
+| 항목 | 내용 |
+| ---- | ---- |
+| 규모 | 16.5M impressions / 700여 캠페인 / 30일 |
+| 라이선스 | CC BY-NC-SA 4.0 |
+| 출처 | Criteo AI Lab |
+
+### 주요 데이터 특성
+
+**CTR이 일반 디스플레이 광고보다 높게 나타나는 이유**
+
+이 데이터셋은 **리타게팅(Retargeting) 광고** 전용 데이터입니다.
+리타게팅은 자사 웹사이트를 이미 방문한 구매 의도 보유 사용자를 대상으로 하며,
+Criteo의 클릭 예측 기반 입찰 시스템이 클릭 가능성이 높은 노출만 낙찰받는 구조이므로
+일반 디스플레이 광고(CTR 0.1~3%) 대비 현저히 높은 클릭률이 나타납니다.
+
+**비용(cost) 필드는 실제 금액이 아닙니다**
+
+Criteo는 영업 비밀 보호를 위해 실제 광고 단가를 정규화된 상대값으로 변환하여 공개합니다.
+공식 문서 원문: *"price paid by Criteo (not real price, transformed version)"*
+따라서 대시보드의 CPA는 실제 광고비 단위가 아닌 **정규화 비용 지수**를 나타냅니다.
+
+### 데이터 준비
+
+`scripts/prepare_criteo_data.py`를 사용하여 원본 TSV에서 실습용 CSV로 변환합니다.
+
+```bash
+python scripts/prepare_criteo_data.py \
+  --input ./data/criteo_attribution_dataset.tsv.gz \
+  --sample 1000000
+```
+
+- Reservoir Sampling으로 전체 파일을 1회 스캔하여 메모리 효율적으로 추출
+- 초기 적재용 800K건 + 증분 적재용 5개 배치 파일 생성
+
+---
+
 ## 주요 구현 내용
 
 ### 실시간 이벤트 수집
